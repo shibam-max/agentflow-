@@ -1,0 +1,53 @@
+groups:
+  - name: agentflow.rules
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          rate(agentflow_task_total{status="failed"}[5m])
+          / rate(agentflow_task_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Task error rate above 5%"
+          description: "{{ $value | humanizePercentage }} of tasks are failing"
+
+      - alert: SlowLLMCalls
+        expr: |
+          histogram_quantile(0.99, rate(agentflow_run_duration_seconds_bucket[10m])) > 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM call p99 latency above 30s"
+          description: "Agent {{ $labels.agent }} p99 latency is {{ $value }}s"
+
+      - alert: TooManyActiveRuns
+        expr: agentflow_active_runs > 80
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High number of concurrent runs"
+          description: "{{ $value }} runs are currently active"
+
+      - alert: PodCrashLooping
+        expr: |
+          rate(kube_pod_container_status_restarts_total{namespace="agentflow"}[15m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pod is crash looping"
+          description: "{{ $labels.pod }} in namespace {{ $labels.namespace }} is restarting"
+
+      - alert: HighMemoryUsage
+        expr: |
+          container_memory_usage_bytes{namespace="agentflow"}
+          / container_spec_memory_limit_bytes{namespace="agentflow"} > 0.85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container memory usage above 85%"
+          description: "{{ $labels.container }} is using {{ $value | humanizePercentage }} of its memory limit"

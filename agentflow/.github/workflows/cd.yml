@@ -1,0 +1,175 @@
+name: CD — Build, Push & Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
+jobs:
+  build-and-push:
+    name: Build Docker images and push to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image tag
+        id: meta
+        run: echo "tag=$(echo $GITHUB_SHA | head -c8)" >> $GITHUB_OUTPUT
+
+      - name: Build and push api-gateway
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/api-gateway
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/agentflow/api-gateway:${{ steps.meta.outputs.tag }}
+            ${{ env.ECR_REGISTRY }}/agentflow/api-gateway:latest
+          cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/agentflow/api-gateway:latest
+          cache-to: type=inline
+
+      - name: Build and push orchestrator
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/orchestrator
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/agentflow/orchestrator:${{ steps.meta.outputs.tag }}
+            ${{ env.ECR_REGISTRY }}/agentflow/orchestrator:latest
+          cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/agentflow/orchestrator:latest
+          cache-to: type=inline
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/frontend
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/agentflow/frontend:${{ steps.meta.outputs.tag }}
+            ${{ env.ECR_REGISTRY }}/agentflow/frontend:latest
+          cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/agentflow/frontend:latest
+          cache-to: type=inline
+
+  deploy-staging:
+    name: Deploy to Staging (EKS)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name agentflow-staging
+
+      - name: Deploy to Kubernetes
+        env:
+          TAG: ${{ needs.build-and-push.outputs.image-tag }}
+          REGISTRY: ${{ env.ECR_REGISTRY }}
+        run: |
+          kubectl set image deployment/api-gateway \
+            api-gateway=$REGISTRY/agentflow/api-gateway:$TAG \
+            -n agentflow
+
+          kubectl set image deployment/orchestrator \
+            orchestrator=$REGISTRY/agentflow/orchestrator:$TAG \
+            -n agentflow
+
+          kubectl set image deployment/frontend \
+            frontend=$REGISTRY/agentflow/frontend:$TAG \
+            -n agentflow
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/api-gateway -n agentflow --timeout=5m
+          kubectl rollout status deployment/orchestrator -n agentflow --timeout=5m
+          kubectl rollout status deployment/frontend -n agentflow --timeout=5m
+
+      - name: Smoke test
+        run: |
+          GATEWAY_URL=$(kubectl get svc api-gateway-svc -n agentflow -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          curl -f http://$GATEWAY_URL:8080/actuator/health || exit 1
+          echo "Smoke test passed"
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: '{"text":"AgentFlow staging deploy FAILED for commit ${{ github.sha }}"}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  deploy-prod:
+    name: Deploy to Production (EKS)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: production   # requires manual approval in GitHub
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for prod EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name agentflow-prod
+
+      - name: Deploy to production
+        env:
+          TAG: ${{ needs.build-and-push.outputs.image-tag }}
+          REGISTRY: ${{ env.ECR_REGISTRY }}
+        run: |
+          kubectl set image deployment/api-gateway \
+            api-gateway=$REGISTRY/agentflow/api-gateway:$TAG \
+            -n agentflow
+          kubectl set image deployment/orchestrator \
+            orchestrator=$REGISTRY/agentflow/orchestrator:$TAG \
+            -n agentflow
+          kubectl set image deployment/frontend \
+            frontend=$REGISTRY/agentflow/frontend:$TAG \
+            -n agentflow
+
+      - name: Wait for prod rollout
+        run: |
+          kubectl rollout status deployment/api-gateway -n agentflow --timeout=10m
+          kubectl rollout status deployment/orchestrator -n agentflow --timeout=10m
+          kubectl rollout status deployment/frontend -n agentflow --timeout=10m
+
+      - name: Notify Slack on success
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: '{"text":"AgentFlow prod deploy SUCCESS — commit ${{ github.sha }}"}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
